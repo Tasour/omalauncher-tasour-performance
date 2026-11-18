@@ -1,0 +1,1191 @@
+widget "Performance" {
+  page: 9
+  order: 1
+  size: 7x5
+  minSize: 5x4
+  meta { owl: 17; version: "1.3"; license: "MIT"; description: "Suivi temps réel de la batterie, du CPU Linux, de la RAM Android, du réseau, des apps récentes et du GPU, notes A à E et moyennes 5 min / 1 h / 6 h / 1 j, avec liste des plus gros consommateurs Linux et purge."; category: "system" }
+
+  requires { pacman: ["procps-ng", "findutils", "util-linux", "jq"] }
+
+  asset killCross = base64"PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZD0iTTYgNiAxOCAxOE0xOCA2IDYgMTgiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjIuNiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+PC9zdmc+"
+  asset killCheck = base64"PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZD0iTTUgMTIgMTAgMTcgMTkgNyIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJjdXJyZW50Q29sb3IiIHN0cm9rZS13aWR0aD0iMi42IiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz48L3N2Zz4="
+
+  source sys = android.system every 5s
+  source dev = android.device
+  source bat = android.battery
+  source power = android.power every 3s
+  source net = android.network every 2s
+  source recent = android.recent
+  source apps = android.apps
+  source modes = android.modes
+  source sim = android.sim
+  source notifs = android.notifications
+  source adbPerf = file("~/.cache/omalauncher/android-perf.json") json
+  source now = clock every 5s
+
+  source coresRaw = cmd("""for c in /sys/devices/system/cpu/cpu*/cpufreq; do
+    cur=$(cat "$c/scaling_cur_freq" 2>/dev/null)
+    max=$(cat "$c/cpuinfo_max_freq" 2>/dev/null)
+    [ -n "$cur" ] && [ -n "$max" ] && echo "$cur $max"
+  done""") every 3s
+
+  source cpuTicksRaw = cmd("""awk '{ c=$0; sub(/^[^(]*[(]/, "", c); sub(/[)].*/, "", c); if (c ~ /^(ps|head|awk|xargs|bash|sh|dash|zsh|fish|proot|libproot.so|foot|tmux: server|pulseaudio|pipewire|wireplumber|dbus-daemon|dbus-broker|dbus-launch|gnome-keyring|gvfsd|xdg-desktop-portal|Xwayland|Xorg|wayland|wlr|labwc|Hyprland|hyprland|sway|swaybg|waybar|mako|dunst|sleep|timeout|tail|grep|sed|date|find|setsid|owl-send|logger.sh|jq|df|systemd|systemd-logind|elogind|openrc|rc-service|login|getty|agetty|ssh|ssh-agent|gpg-agent|init|kworker)$/) next; r=$0; sub(/^[^)]*[)] /, "", r); split(r, f, " "); s+=f[12]+f[13] } END { print s+0 }' /proc/[0-9]*/stat 2>/dev/null""") every 5s
+
+  source gpuRaw = cmd("""p=""
+  for f in /sys/class/kgsl/kgsl-3d0/gpu_busy_percentage /sys/class/misc/mali0/device/utilisation /sys/kernel/gpu/gpu_busy; do
+    if [ -r "$f" ]; then p=$(cat "$f"); break; fi
+  done
+  if [ -z "$p" ]; then
+    f=/sys/class/kgsl/kgsl-3d0/gpubusy
+    if [ -r "$f" ]; then set -- $(cat "$f" 2>/dev/null); if [ -n "$2" ] && [ "$2" -gt 0 ]; then p=$(( $1 * 100 / $2 )); fi; fi
+  fi
+  echo "$p"
+  """) every 5s
+
+  source trend = cmd("""f=$(ls -t "$HOME/.local/share/omalauncher/perf"/raw-*.jsonl 2>/dev/null | head -1)
+  [ -n "$f" ] && tail -n 2000 "$f" | jq -s '
+    [ .[] | select(.src == "linux") |
+      {ts: .ts,
+       cpu: (.cpuPct // null),
+       ram: (if .mem and .mem.total > 0 then ((.mem.total - .mem.available) / .mem.total * 100) else null end),
+       freq: (.freqPct // null)} |
+      select(.ts != null) ] as $a |
+    if ($a|length) == 0 then {cpu:[],ram:[],freq:[]}
+    else
+      ($a | map(.ts) | min) as $t0 |
+      ($a | map(. + {h: (((.ts - $t0) / 1800)|floor)})) |
+      group_by(.h) |
+      { cpu: (map([.[].cpu] | map(select(. != null)) | if length>0 then (add/length) else null end)),
+        ram: (map([.[].ram] | map(select(. != null)) | if length>0 then (add/length) else null end)),
+        freq: (map([.[].freq] | map(select(. != null)) | if length>0 then (add/length) else null end)) }
+    end' 2>/dev/null""") every 5m json
+
+  source topCpuRaw = cmd("""ps -eo pid=,pcpu=,rss=,comm= --sort=-pcpu | head -40 | awk '{ name=$4; for (i=5; i<=NF; i++) name=name " " $i; if (name ~ /^(ps|head|awk|xargs|bash|sh|dash|zsh|fish|proot|libproot.so|foot|tmux: server|pulseaudio|pipewire|wireplumber|dbus-daemon|dbus-broker|dbus-launch|gnome-keyring|gvfsd|xdg-desktop-portal|Xwayland|Xorg|wayland|wlr|labwc|Hyprland|hyprland|sway|swaybg|waybar|mako|dunst|sleep|timeout|tail|grep|sed|date|find|setsid|owl-send|logger.sh|jq|df|systemd|systemd-logind|elogind|openrc|rc-service|login|getty|agetty|ssh|ssh-agent|gpg-agent|init|kworker)$/) next; if (++c > 16) exit; print $1 "|" $2 "|" $3 "|" name }'""") every 8s
+
+  source topRamRaw = cmd("""ps -eo pid=,pcpu=,rss=,comm= --sort=-rss | head -40 | awk '{ name=$4; for (i=5; i<=NF; i++) name=name " " $i; if (name ~ /^(ps|head|awk|xargs|bash|sh|dash|zsh|fish|proot|libproot.so|foot|tmux: server|pulseaudio|pipewire|wireplumber|dbus-daemon|dbus-broker|dbus-launch|gnome-keyring|gvfsd|xdg-desktop-portal|Xwayland|Xorg|wayland|wlr|labwc|Hyprland|hyprland|sway|swaybg|waybar|mako|dunst|sleep|timeout|tail|grep|sed|date|find|setsid|owl-send|logger.sh|jq|df|systemd|systemd-logind|elogind|openrc|rc-service|login|getty|agetty|ssh|ssh-agent|gpg-agent|init|kworker)$/) next; if (++c > 16) exit; print $1 "|" $2 "|" $3 "|" name }'""") every 8s
+
+  state avgB = {} persist
+  state avgC = {} persist
+  state avgR = {} persist
+  state avgAt = 0 persist
+  state confirmPurge = false
+  state confirmAt = 0
+  state appMode = "recent"
+  state showAndroidAll = false
+  state purgeAt = 0
+  state killPid = 0
+  state killAt = 0
+  state lastLog = 0
+
+  onTap: screen()
+  at confirmAt { confirmPurge = false; confirmAt = 0 }
+  at purgeAt { purgeAt = 0 }
+  at killAt { killPid = 0; killAt = 0 }
+
+  let memTotal = sys.memory.total ?? 0
+  let memUsed = sys.memory.used ?? 0
+  let ramPct = memTotal > 0 ? memUsed / memTotal * 100 : null
+  let ramGradePct = ramPct == null ? avgR.m5 : (avgR.m5 == null ? ramPct : ramPct * 0.5 + avgR.m5 * 0.5)
+  let ramQ = ramGradePct == null ? null : clamp(100 - (ramGradePct - 50) * 1.5, 0, 100)
+  let ramHist = history(ramPct, 60)
+
+  let coreList = lines(coresRaw).filter(l => l != "").map(l => { cur: num(words(l)[0]), max: num(words(l)[1]) })
+  let freqCur = sum(coreList.map(c => c.cur))
+  let freqMax = sum(coreList.map(c => c.max))
+  let freqPct = freqMax > 0 ? clamp(freqCur / freqMax * 100, 0, 100) : null
+  let cpuTicks = num(cpuTicksRaw)
+  let cpuPrev = prev(cpuTicksRaw)
+  let upPrev = prev(sys.uptime)
+  let cores = sys.cpu.cores ?? 0
+  let cpuPct = cpuTicks != null && cpuPrev != null && upPrev != null && sys.uptime != null && sys.uptime > upPrev && cores > 0 ? clamp((cpuTicks - num(cpuPrev)) / ((sys.uptime - upPrev) * cores), 0, 100) : null
+  let cpuGradePct = cpuPct == null ? avgC.m5 : (avgC.m5 == null ? cpuPct : cpuPct * 0.5 + avgC.m5 * 0.5)
+  let cpuQ = cpuGradePct == null ? null : clamp(100 - cpuGradePct, 0, 100)
+  let cpuHist = history(cpuPct, 60)
+
+  let gpuText = trim(gpuRaw ?? "")
+  let gpuPct = gpuText == "" ? null : clamp(num(match(gpuText, "([0-9.]+)")[0]), 0, 100)
+  let gpuQ = gpuPct == null ? null : clamp(100 - gpuPct, 0, 100)
+
+  let watts = power.watts != null ? abs(power.watts) : (power.current != null && bat.voltage != null ? abs(power.current * bat.voltage / 1000) : null)
+  let charging = bat.charging ?? false
+  let drawW = watts == null ? null : (charging ? 0 : watts)
+  let batGradeW = charging ? 0 : (drawW == null ? avgB.m5 : (avgB.m5 == null ? drawW : drawW * 0.5 + avgB.m5 * 0.5))
+  let batQ = batGradeW == null ? null : clamp(100 - batGradeW * 7, 0, 100)
+  let temp = bat.temp
+  let tempQ = temp == null ? null : clamp(100 - (temp - 30) * 7, 0, 100)
+
+  let qs = [batQ, batQ, batQ, cpuQ, cpuQ, ramQ, ramQ, gpuQ, tempQ].filter(q => q != null)
+  let overall = len(qs) > 0 ? round(avg(qs)) : null
+
+  let cA = "#45e0a0"
+  let cB = "#4cc9f0"
+  let cC = "#f5c542"
+  let cD = "#ff9f43"
+  let cE = "#ff5c74"
+  let cF = "#b98cff"
+  let gpuCardTint = gpuPct == null ? cB : cF
+
+  let batColor = bat.level == null ? muted : bat.level <= 15 ? cE : bat.level <= 30 ? cD : bat.level <= 50 ? cC : cA
+  let cpuColor = cpuQ == null ? muted : cB
+  let ramColor = ramQ == null ? muted : cC
+  let gpuColor = gpuQ == null ? muted : cF
+  let avgBColor = avgB.m5 == null ? muted : avgB.m5 >= 5 ? cE : avgB.m5 >= 3 ? cD : avgB.m5 >= 2 ? cC : cA
+
+  let tempColor = temp == null ? muted : temp <= 35 ? cA : temp <= 38 ? cB : temp <= 41 ? cC : temp <= 44 ? cD : cE
+  let powerColor = charging ? cB : batColor
+  let coreColor = freqPct == null ? muted : freqPct >= 85 ? cD : freqPct >= 60 ? cC : freqPct >= 35 ? cB : cA
+  let freqHist = history(freqPct, 100)
+  let wattsHist = history(watts, 100)
+  let chartWMax = (max(wattsHist) ?? 0) > 8 ? max(wattsHist) : 8
+  let coreRatios = coreList.map(c => { pct: (c.max ?? 0) > 0 ? (c.cur ?? 0) / (c.max ?? 1) * 100 : 0 })
+  let clusterMap = groupBy(coreList.filter(c => c.max != null), c => c.max)
+  let clusterKeys = keys(clusterMap).sortBy(k => -(num(k) ?? 0))
+  let clusters = clusterKeys.map(k => {
+    load: avg(get(clusterMap, k, []).map(c => (c.max ?? 0) > 0 ? (c.cur ?? 0) / (c.max ?? 1) * 100 : 0)),
+    count: len(get(clusterMap, k, [])),
+    max: num(k)
+  })
+  let avgBMax = max([avgB.m5 ?? 0, avgB.h1 ?? 0, avgB.h6 ?? 0, avgB.d1 ?? 0]) ?? 0
+  let avgBScale = avgBMax > 0 ? avgBMax : 1
+  let tallChart = (rows ?? 5) >= 6 ? 90 : 40
+  let trendCpu = (trend.cpu ?? []).filter(v => v != null)
+  let trendRam = (trend.ram ?? []).filter(v => v != null)
+  let trendFreq = (trend.freq ?? []).filter(v => v != null)
+  let trendCpuLast = len(trendCpu) > 0 ? trendCpu[len(trendCpu) - 1] : null
+  let trendRamLast = len(trendRam) > 0 ? trendRam[len(trendRam) - 1] : null
+  let trendFreqLast = len(trendFreq) > 0 ? trendFreq[len(trendFreq) - 1] : null
+
+  let socName = sys.cpu.soc ?? dev.soc ?? ""
+  let screenHz = sys.display.hz ?? 0
+  let screenRes = "${sys.display.width ?? "…"}×${sys.display.height ?? "…"}"
+  let storagePct = sys.storage.total != null && sys.storage.total > 0 ? (sys.storage.used ?? 0) / sys.storage.total * 100 : null
+  let nowSec = now ?? 0
+  let adbRaw = adbPerf != null && adbPerf.available == true
+  let adbAge = adbRaw ? nowSec - (adbPerf.ts ?? 0) : null
+  let adb = adbRaw && adbAge != null && adbAge <= 60
+  let adbCpu = adb ? (adbPerf.cpuPct ?? null) : null
+  let adbProcs = adb ? (adbPerf.procs ?? []) : []
+  let adbTop5 = adbProcs.take(5)
+  let adbMaxProcCpu = max(adbTop5.map(p => p.cpu ?? 0)) ?? 1
+  let adbThermal = adb ? adbPerf.thermal : null
+  let adbMem = adb ? adbPerf.mem : null
+  let adbModel = adb ? (adbPerf.model ?? "") : ""
+  let adbAndroid = adb ? (adbPerf.android ?? "") : ""
+  let adbReason = adbRaw && !adb ? "données ADB figées" : (adbPerf != null && adbPerf.reason != null ? adbPerf.reason : "non configuré")
+  let adbHelperStart = """setsid "$HOME/.local/share/omalauncher/perf/android-adb.sh" >/dev/null 2>&1 &"""
+  let adbHelperStop = """kill $(cat "$HOME/.local/share/omalauncher/perf/android-adb.pid") 2>/dev/null"""
+  let purgeDone = purgeAt > 0 && purgeAt > nowSec
+  let purgeTone = purgeDone ? cA : cE
+  let netDownPrev = prev(net.rx)
+  let netUpPrev = prev(net.tx)
+  let netAtPrev = prev(net.uptime)
+  let netDt = net.uptime != null && netAtPrev != null ? net.uptime - netAtPrev : null
+  let downRateRaw = net.rx != null && netDownPrev != null && netDt != null && netDt >= 1 && net.rx >= netDownPrev ? (net.rx - netDownPrev) / netDt : null
+  let upRateRaw = net.tx != null && netUpPrev != null && netDt != null && netDt >= 1 && net.tx >= netUpPrev ? (net.tx - netUpPrev) / netDt : null
+  let downRatePrev = prev(downRateRaw)
+  let upRatePrev = prev(upRateRaw)
+  let downRate = downRateRaw == null || downRatePrev == null ? null : min(downRateRaw, downRatePrev)
+  let upRate = upRateRaw == null || upRatePrev == null ? null : min(upRateRaw, upRatePrev)
+  let netHist = history(downRate, 60)
+  let netMax = max(max(netHist) ?? 0, 1024)
+  let netCumul = downRate == null && net.rx != null
+  let netText = downRate == null ? (net.rx == null ? "…" : fmtBytes(net.rx)) : fmtBytes(downRate) + "/s"
+  let netUpText = upRate == null ? (net.tx == null ? "…" : fmtBytes(net.tx)) : fmtBytes(upRate) + "/s"
+  let mobileRxPrev = prev(net.mobileRx)
+  let mobileTxPrev = prev(net.mobileTx)
+  let mobileDownRaw = net.mobileRx != null && mobileRxPrev != null && netDt != null && netDt >= 1 && net.mobileRx >= mobileRxPrev ? (net.mobileRx - mobileRxPrev) / netDt : null
+  let mobileUpRaw = net.mobileTx != null && mobileTxPrev != null && netDt != null && netDt >= 1 && net.mobileTx >= mobileTxPrev ? (net.mobileTx - mobileTxPrev) / netDt : null
+  let mobileDownPrev = prev(mobileDownRaw)
+  let mobileUpPrev = prev(mobileUpRaw)
+  let mobileDownRate = mobileDownRaw == null || mobileDownPrev == null ? null : min(mobileDownRaw, mobileDownPrev)
+  let mobileUpRate = mobileUpRaw == null || mobileUpPrev == null ? null : min(mobileUpRaw, mobileUpPrev)
+  let wifiDownRate = downRate != null && mobileDownRate != null ? max(0, downRate - mobileDownRate) : null
+  let wifiUpRate = upRate != null && mobileUpRate != null ? max(0, upRate - mobileUpRate) : null
+  let mobileText = mobileDownRate == null ? "…" : fmtBytes(mobileDownRate) + "/s"
+  let wifiText = wifiDownRate == null ? "…" : fmtBytes(wifiDownRate) + "/s"
+  let recentAndroid = (recent ?? []).filter(a => a.kind == "android").take(5)
+  let cpuMaxGhz = sys.cpu.maxMhz == null ? null : sys.cpu.maxMhz / 1000
+  let healthFr = bat.health == null ? null : bat.health == "good" ? "bonne" : bat.health == "overheat" ? "surchauffe" : bat.health == "cold" ? "froide" : bat.health == "dead" ? "HS" : bat.health == "over_voltage" ? "surtension" : bat.health == "unspecified_failure" ? "défaut" : bat.health
+  let batHealthLine = healthFr == null && bat.cycles == null ? null : "santé ${healthFr ?? "n/d"}${bat.cycles == null ? "" : " · ${bat.cycles} cycles"}"
+  let frequentApps = (apps ?? []).filter(a => a.system != true && a.last != null).sortBy(a => -(a.score ?? 0)).take(5)
+  let currentApps = appMode == "recent" ? recentAndroid : frequentApps
+  let appNote = "Android ne partage pas le CPU par app. " + (appMode == "recent" ? "Voici les apps récemment actives" : "Voici les apps les plus utilisées (score du launcher)") + " ; la mémoire, le stockage, le réseau et la batterie viennent aussi d'Android."
+  let chargerW = power.maxCurrent != null && power.maxVoltage != null ? power.maxCurrent * power.maxVoltage / 1000 : null
+  let chargeLeft = power.chargeTime == null ? null : fmtDuration(power.chargeTime)
+  let currentMa = power.current == null ? null : "${round(abs(power.current))} mA"
+  let chargeMah = power.charge == null ? null : "${fmtNum(power.charge)} mAh"
+  let batteryDetail = chargerW != null || chargeLeft != null || currentMa != null || chargeMah != null || healthFr != null || bat.cycles != null || bat.technology != null
+  let deviceLabel = trim("${dev.maker ?? ""} ${dev.model ?? ""}")
+  let androidLabel = "${dev.android ?? "…"} · API ${dev.sdk ?? "…"}"
+  let uptimeText = sys.uptime == null ? null : fmtDuration(sys.uptime)
+  let storageFree = sys.storage.free == null ? null : fmtBytes(sys.storage.free) + " libres"
+  let dndText = modes.dnd == null ? null : modes.dnd != true ? "off" : modes.dndAllows == "none" ? "silence" : modes.dndAllows == "alarms" ? "alarmes" : modes.dndAllows == "priority" ? "priorité" : "on"
+  let ringerText = modes.ringer == "vibrate" ? "vibreur" : modes.ringer == "silent" ? "silencieux" : modes.ringer == "normal" ? "normal" : (modes.ringer ?? "—")
+  let brightnessText = modes.brightness == null ? null : (modes.autoBrightness == true ? "auto · ${modes.brightness} %" : "${modes.brightness} %")
+  let simText = sim.available == false ? "absent" : sim.carrier == null ? "n/d" : "${sim.carrier} · ${sim.signal ?? "…"}/4"
+  let notifText = notifs.available == true ? "${notifs.count ?? 0} actives" : "accès non accordé"
+
+  let batSub = "${charging ? "en charge" : "décharge"} · ${drawW == null ? "…" : fixed(drawW, 1)} W · ${temp == null ? "…" : round(temp)} °C"
+  let cpuSub = "5m ${avgC.m5 == null ? "…" : round(avgC.m5)} % · fréq. ${freqPct == null ? "…" : round(freqPct)} %"
+  let cpuDisplay = cpuPct ?? avgC.m5
+  let ramDisplay = ramPct ?? avgR.m5
+  let cpuSubScreen = "Linux · fréq. ${freqPct == null ? "…" : round(freqPct)} % · ${sys.cpu.cores ?? 0} cœurs"
+  let ramSub = "${fmtBytes(memUsed)} / ${fmtBytes(memTotal)}"
+  let gpuSub = gpuPct == null ? "charge n/d" : "charge"
+  let gpuName = contains(sys.cpu.soc ?? "", "SM8350") ? "Adreno 660" : contains(sys.cpu.soc ?? "", "SM8450") ? "Adreno 730" : contains(sys.cpu.soc ?? "", "SM8475") ? "Adreno 730" : contains(sys.cpu.soc ?? "", "SM8550") ? "Adreno 740" : contains(sys.cpu.soc ?? "", "SM8650") ? "Adreno 750" : contains(sys.cpu.soc ?? "", "SM7550") ? "Adreno 720" : contains(sys.cpu.soc ?? "", "MT6983") ? "Mali-G710" : contains(sys.cpu.soc ?? "", "MT6985") ? "Mali-G715" : contains(sys.cpu.soc ?? "", "Tensor") ? "Mali" : "GPU"
+
+  let topCpu = lines(topCpuRaw).filter(l => l != "").map(l => { pid: num(split(l, "|")[0]), cpu: num(split(l, "|")[1]), rss: num(split(l, "|")[2]) * 1024, name: split(l, "|")[3] }).filter(p => p.pid != null && p.name != "")
+  let topRam = lines(topRamRaw).filter(l => l != "").map(l => { pid: num(split(l, "|")[0]), cpu: num(split(l, "|")[1]), rss: num(split(l, "|")[2]) * 1024, name: split(l, "|")[3] }).filter(p => p.pid != null && p.name != "")
+  let cpuTop5 = topCpu.take(5)
+  let ramTop5 = topRam.take(5)
+  let maxProcCpu = max(cpuTop5.map(p => p.cpu ?? 0)) ?? 1
+  let maxProcRss = max(ramTop5.map(p => p.rss ?? 0)) ?? 1
+  let killName = first(cpuTop5.filter(p => p.pid == killPid).map(p => p.name)) ?? first(ramTop5.filter(p => p.pid == killPid).map(p => p.name)) ?? ""
+
+  let purgeCmd = """sync
+  ps -eo pid=,pcpu=,rss=,comm= | awk '{ name=$4; for (i=5; i<=NF; i++) name=name " " $i; if (name ~ /^(ps|head|awk|xargs|bash|sh|dash|zsh|fish|proot|libproot.so|foot|tmux: server|pulseaudio|pipewire|wireplumber|dbus-daemon|dbus-broker|dbus-launch|gnome-keyring|gvfsd|xdg-desktop-portal|Xwayland|Xorg|wayland|wlr|labwc|Hyprland|hyprland|sway|swaybg|waybar|mako|dunst|sleep|timeout|tail|grep|sed|date|find|setsid|owl-send|logger.sh|jq|df|systemd|systemd-logind|elogind|openrc|rc-service|login|getty|agetty|ssh|ssh-agent|gpg-agent|init|kworker)$/) next; if ($2 + 0 >= 3 || $3 + 0 >= 150000) print $1 }' | while read p; do kill -TERM "$p" 2>/dev/null; done"""
+
+  let payload = { v: 1, src: "android", uptime: sys.uptime, device: dev, battery: bat, power: power, system: { memory: sys.memory, storage: sys.storage, cpu: sys.cpu }, perf: { cpuPct: cpuPct, freqPct: freqPct, ramPct: ramPct, gpuPct: gpuPct, cores: coreList }, procs: { cpu: topCpu.take(6), ram: topRam.take(6) } }
+  let logCmd = """d="$HOME/.local/share/omalauncher/perf"
+  mkdir -p "$d"
+  echo """ + sh(toJson(payload)) + """ | jq -c --argjson ts "$(date +%s)" '.ts=$ts' >> "$d/raw-$(date +%F).jsonl"
+  """
+  let loggerStart = """setsid "$HOME/.local/share/omalauncher/perf/logger.sh" >/dev/null 2>&1 &"""
+  let logDue = sys.uptime != null && (lastLog == 0 || sys.uptime - lastLog >= 60)
+
+  when logDue { lastLog = sys.uptime; run(logCmd) }
+
+  when sys.uptime != null { run(loggerStart) }
+  every 5m { run(loggerStart) }
+
+  every 5s {
+    let t = now ?? 0
+    let dt = (avgAt > 0 && t > 0) ? clamp(t - avgAt, 1, 60) : 5
+    let k5 = min(1, dt / 300)
+    let k1 = min(1, dt / 3600)
+    let k6 = min(1, dt / 21600)
+    let kd = min(1, dt / 86400)
+    if cpuPct != null {
+      let oC = avgC
+      avgC = { m5: (oC.m5 ?? cpuPct) + (cpuPct - (oC.m5 ?? cpuPct)) * k5, h1: (oC.h1 ?? cpuPct) + (cpuPct - (oC.h1 ?? cpuPct)) * k1, h6: (oC.h6 ?? cpuPct) + (cpuPct - (oC.h6 ?? cpuPct)) * k6, d1: (oC.d1 ?? cpuPct) + (cpuPct - (oC.d1 ?? cpuPct)) * kd }
+    }
+    if ramPct != null {
+      let oR = avgR
+      avgR = { m5: (oR.m5 ?? ramPct) + (ramPct - (oR.m5 ?? ramPct)) * k5, h1: (oR.h1 ?? ramPct) + (ramPct - (oR.h1 ?? ramPct)) * k1, h6: (oR.h6 ?? ramPct) + (ramPct - (oR.h6 ?? ramPct)) * k6, d1: (oR.d1 ?? ramPct) + (ramPct - (oR.d1 ?? ramPct)) * kd }
+    }
+    if !charging && drawW != null {
+      let oB = avgB
+      avgB = { m5: (oB.m5 ?? drawW) + (drawW - (oB.m5 ?? drawW)) * k5, h1: (oB.h1 ?? drawW) + (drawW - (oB.h1 ?? drawW)) * k1, h6: (oB.h6 ?? drawW) + (drawW - (oB.h6 ?? drawW)) * k6, d1: (oB.d1 ?? drawW) + (drawW - (oB.d1 ?? drawW)) * kd }
+    }
+    avgAt = t
+  }
+
+  component Badge(v, big = false) {
+    let g = v == null ? "—" : v >= 95 ? "A+" : v >= 90 ? "A" : v >= 85 ? "A-" : v >= 80 ? "B+" : v >= 74 ? "B" : v >= 68 ? "B-" : v >= 62 ? "C+" : v >= 56 ? "C" : v >= 50 ? "C-" : v >= 42 ? "D+" : v >= 34 ? "D" : v >= 26 ? "D-" : "E"
+    let c = v == null ? muted : v >= 80 ? cA : v >= 62 ? cB : v >= 50 ? cC : v >= 26 ? cD : cE
+    Box {
+      width: big ? 62 : 38
+      padding: big ? [10, 4] : [7, 2]
+      align: center
+      radius: (big ? 9 : 6) * corners
+      background: linear(0, 0, 1, 1, [alpha(c, big ? 0.30 : 0.20), alpha(c, big ? 0.10 : 0.06)])
+      border: 1
+      borderColor: alpha(c, big ? 0.42 : 0.26)
+      Text { text: g; color: c; fontSize: big ? 15 : 11; fontWeight: 800; maxLines: 1 }
+    }
+  }
+
+  component SectionTitle(title, hint = "", tint = cB) {
+    Row {
+      align: center
+      gap: 6
+      Box { width: 3; height: 14; radius: 1.5; background: linear(0, 0, 0, 1, [tint, alpha(tint, 0.20)]) }
+      Text { text: title; style: label; color: muted; letterSpacing: 1.2; weight: 1; maxLines: 1 }
+      if hint != "" { Text { text: hint; style: label; color: muted; maxLines: 1 } }
+      Box { width: 20; height: 1; background: linear(0, 0, 1, 0, [alpha(tint, 0.0), alpha(tint, 0.40)]) }
+    }
+  }
+
+  component StatPill(label, value, tint = cB) {
+    Row {
+      align: center
+      gap: 4
+      padding: [7, 3]
+      radius: 8 * corners
+      background: alpha(tint, 0.10)
+      border: 1
+      borderColor: alpha(tint, 0.18)
+      Box { width: 5; height: 5; radius: 2.5; background: tint }
+      Text { text: label; style: label; color: muted; maxLines: 1 }
+      Text { text: value; fontSize: 11; fontWeight: 700; color: tint; maxLines: 1 }
+    }
+  }
+
+  component Detail(label, value, tint = muted) {
+    Column {
+      gap: 1
+      Text { text: label; style: label; color: muted; maxLines: 1 }
+      Text { text: value ?? "—"; fontSize: 12; fontWeight: 700; color: value == null ? muted : tint; maxLines: 1 }
+    }
+  }
+
+  component Dial(label, value, cap, tint, size, thickness, ticks = false) {
+    Box {
+      width: size
+      height: size
+      align: center
+      Box {
+        width: size + 18
+        height: size + 18
+        background: radial(0.5, 0.5, 0.5, [alpha(tint, 0.16), alpha(tint, 0.0)])
+      }
+      if ticks {
+        Canvas {
+          for i in range(44) {
+            let a = i / 44 * 360
+            rotate(a, width / 2, height / 2) {
+              line(width / 2, size * 0.075, width / 2, size * (i % 4 == 0 ? 0.112 : 0.098), stroke: alpha(tint, i % 4 == 0 ? 0.55 : 0.20), width: 1)
+            }
+          }
+        }
+      }
+      Ring { value: value; max: cap; size: size; thickness: thickness; color: tint; track: alpha(tint, 0.10) }
+      Text { text: label; fontSize: size * 0.38; fontWeight: 800; color: tint; align: center; maxLines: 1 }
+    }
+  }
+
+  component AvgChip(label, value, unit, tint, scale, digits = 1) {
+    Column {
+      gap: 3
+      Text { text: label; style: label; color: muted; maxLines: 1 }
+      Text { text: value == null ? "—" : "${fixed(value, digits)}${unit}"; fontSize: 13; fontWeight: 700; color: value == null ? muted : tint; maxLines: 1 }
+      Progress { value: value ?? 0; max: scale; height: 2; fill: width; color: alpha(tint, 0.85); track: alpha(tint, 0.10) }
+    }
+  }
+
+  component AvgRow(name, tint, a, b, c, d, unit, digits = 0) {
+    Row {
+      gap: 4
+      padding: [3, 0]
+      Row {
+        gap: 6
+        align: center
+        width: 84
+        Box { width: 6; height: 6; radius: 3; background: tint }
+        Text { text: name; style: small; color: foreground; maxLines: 1 }
+      }
+      Text { text: a == null ? "—" : "${fixed(a, digits)}${unit}"; fontSize: 13; fontWeight: 700; color: tint; weight: 1; align: end; maxLines: 1 }
+      Text { text: b == null ? "—" : "${fixed(b, digits)}${unit}"; fontSize: 13; fontWeight: 700; color: tint; weight: 1; align: end; maxLines: 1 }
+      Text { text: c == null ? "—" : "${fixed(c, digits)}${unit}"; fontSize: 13; fontWeight: 700; color: tint; weight: 1; align: end; maxLines: 1 }
+      Text { text: d == null ? "—" : "${fixed(d, digits)}${unit}"; fontSize: 13; fontWeight: 700; color: tint; weight: 1; align: end; maxLines: 1 }
+    }
+  }
+
+  component ChartCard(title, value, unit, values, tint, chartMax, sub, digits = 0) {
+    Column {
+      gap: 7
+      padding: 10
+      radius: 14 * corners
+      background: linear(0, 0, 1, 1, [alpha(tint, 0.17), alpha(surface, 0.55)])
+      border: 1
+      borderColor: alpha(tint, 0.16)
+      Row {
+        align: center
+        Column {
+          gap: 1
+          weight: 1
+          Text { text: title; style: label; color: muted; letterSpacing: 1; maxLines: 1 }
+          Text { text: sub; style: label; color: muted; maxLines: 1 }
+        }
+        Column {
+          gap: 2
+          align: end
+          Text { text: value == null ? "…" : "${fixed(value, digits)}${unit}"; fontSize: 18; fontWeight: 700; color: tint; maxLines: 1 }
+          Box { width: 26; height: 2; radius: 1; background: linear(0, 0, 1, 0, [alpha(tint, 0.0), alpha(tint, 0.75)]) }
+        }
+      }
+      Box {
+        height: 42
+        Canvas {
+          for i in range(1, 4) {
+            line(0, height * i / 4, width, height * i / 4, stroke: alpha(foreground, 0.045), width: 1)
+          }
+        }
+        Sparkline { values: values; min: 0; max: chartMax; color: tint; area: alpha(tint, 0.11); fill: width; height: 42; thickness: 2 }
+      }
+    }
+  }
+
+  component CoreBars(cores, showLabels = false) {
+    Row {
+      gap: 4
+      for c, i in cores key i {
+        let cc = c.pct >= 85 ? cE : c.pct >= 60 ? cD : c.pct >= 35 ? cC : cA
+        Column {
+          weight: 1
+          gap: 3
+          align: center
+          Box {
+            fill: width
+            height: 26
+            radius: 6
+            background: alpha(foreground, 0.045)
+            align: bottom
+            Box {
+              fill: width
+              height: 3 + c.pct * 0.23
+              radius: 5
+              background: linear(0, 0, 0, 1, [alpha(cc, 0.95), alpha(cc, 0.38)])
+            }
+          }
+          if showLabels { Text { text: "${i + 1}"; style: label; color: muted; maxLines: 1 } }
+        }
+      }
+    }
+  }
+
+  component ClusterBars(clusters) {
+    Row {
+      gap: 6
+      for c, i in clusters key i {
+        let cc = c.load >= 85 ? cE : c.load >= 60 ? cD : c.load >= 35 ? cC : cA
+        Column {
+          weight: 1
+          gap: 2
+          Text { text: "${c.count}× ${fixed((c.max ?? 0) / 1000000, 2)} GHz"; style: label; color: muted; maxLines: 1 }
+          Progress { value: c.load ?? 0; max: 100; height: 3; fill: width; color: cc; track: alpha(foreground, 0.06) }
+          Text { text: "${c.load == null ? "…" : round(c.load)} %"; style: label; color: cc; maxLines: 1 }
+        }
+      }
+    }
+  }
+
+  Column {
+    gap: 6
+    justify: spaceBetween
+    Row {
+      align: center
+      gap: 7
+      Box {
+        width: 9
+        height: 9
+        align: center
+        Box { width: 9; height: 9; radius: 4.5; background: alpha(cA, 0.18) }
+        Box { width: 5; height: 5; radius: 2.5; background: cA }
+      }
+      Text { text: "PERFORMANCE"; style: label; color: muted; letterSpacing: 1.5; weight: 1 }
+      Row {
+        align: center
+        gap: 4
+        padding: [7, 3]
+        radius: 8 * corners
+        background: alpha(tempColor, 0.10)
+        border: 1
+        borderColor: alpha(tempColor, 0.18)
+        Text { text: "${temp == null ? "…" : round(temp)}°C"; fontSize: 11; fontWeight: 700; color: tempColor; maxLines: 1 }
+      }
+      Badge { v: overall }
+      Text { text: "détail ›"; style: label; color: muted; maxLines: 1 }
+    }
+    Row {
+      gap: 6
+      height: 122
+      Box {
+        weight: 1.30
+        height: 122
+        padding: 8
+        radius: 16 * corners
+        background: linear(0, 0, 0.9, 1, [alpha(batColor, 0.24), alpha(surface, 0.50)])
+        border: 1
+        borderColor: alpha(batColor, 0.18)
+        Column {
+          gap: 4
+          justify: spaceBetween
+          Row {
+            align: center
+            gap: 5
+            Text { text: "BATTERIE"; style: label; color: muted; letterSpacing: 1.1; weight: 1 }
+            Box { width: 24; height: 2; radius: 1; background: linear(0, 0, 1, 0, [alpha(batColor, 0.0), alpha(batColor, 0.65)]) }
+            Badge { v: batQ }
+          }
+          Row {
+            align: center
+            gap: 8
+            Dial { label: "${bat.level ?? "…"}"; value: bat.level ?? 0; cap: 100; tint: batColor; size: 62; thickness: 5; ticks: true }
+            Column {
+              gap: 1
+              weight: 1
+              Text { text: charging ? "EN CHARGE" : "DÉCHARGE"; style: label; color: powerColor; maxLines: 1 }
+              Text { text: drawW == null ? "…" : "${fixed(drawW, 1)} W"; fontSize: 22; fontWeight: 700; color: powerColor; maxLines: 1 }
+              Text { text: "${temp == null ? "…" : round(temp)} °C"; style: label; color: muted; maxLines: 1 }
+            }
+          }
+          Sparkline { values: wattsHist; min: 0; max: chartWMax; color: powerColor; area: alpha(powerColor, 0.16); fill: width; height: 13; thickness: 1.5 }
+        }
+      }
+      Column {
+        gap: 6
+        weight: 1
+        height: 122
+        Box {
+          height: 57
+          padding: [6, 5]
+          radius: 13 * corners
+          background: linear(0, 0, 1, 1, [alpha(cpuColor, 0.18), alpha(surface, 0.48)])
+          border: 1
+          borderColor: alpha(cpuColor, 0.14)
+          Column {
+            gap: 1
+            Row {
+              Text { text: "CPU LINUX"; style: label; color: muted; letterSpacing: 1.05; weight: 1 }
+              Badge { v: cpuQ }
+            }
+            Row {
+              align: bottom
+              Text { text: "${cpuDisplay == null ? "…" : round(cpuDisplay)}"; fontSize: 19; fontWeight: 700; color: cpuColor; weight: 1; maxLines: 1 }
+              Text { text: "%"; style: label; color: muted; maxLines: 1 }
+            }
+            Text { text: cpuSub; style: label; color: muted; maxLines: 1 }
+          }
+        }
+        Box {
+          height: 59
+          padding: [6, 5]
+          radius: 13 * corners
+          background: linear(0, 0, 1, 1, [alpha(ramColor, 0.18), alpha(surface, 0.48)])
+          border: 1
+          borderColor: alpha(ramColor, 0.14)
+          Column {
+            gap: 1
+            Row {
+              Text { text: "RAM ANDROID"; style: label; color: muted; letterSpacing: 1.05; weight: 1 }
+              Badge { v: ramQ }
+            }
+            Row {
+              align: bottom
+              Text { text: "${ramDisplay == null ? "…" : round(ramDisplay)}"; fontSize: 19; fontWeight: 700; color: ramColor; weight: 1; maxLines: 1 }
+              Text { text: "%"; style: label; color: muted; maxLines: 1 }
+            }
+            Progress { value: ramPct ?? 0; max: 100; color: ramColor; height: 4; fill: width; track: alpha(ramColor, 0.10) }
+            Text { text: ramSub; style: label; color: muted; maxLines: 1 }
+          }
+        }
+      }
+    }
+    if (rows ?? 5) >= 5 {
+      Row {
+        gap: 6
+        Box {
+          weight: 2
+          padding: [6, 5]
+          radius: 12 * corners
+          background: linear(0, 0, 1, 1, [alpha(cF, 0.10), alpha(surface, 0.44)])
+          border: 1
+          borderColor: alpha(cF, 0.12)
+          Column {
+            gap: 4
+            Row {
+              Text { text: "CŒURS"; style: label; color: muted; letterSpacing: 1; weight: 1 }
+              Text { text: "${freqPct == null ? "…" : round(freqPct)} %"; style: label; color: coreColor }
+            }
+            if len(coreRatios) == 0 {
+              Text { text: "Fréquences indisponibles"; style: label; color: muted }
+            } else {
+              CoreBars { cores: coreRatios }
+            }
+          }
+        }
+        Box {
+          weight: 1
+          padding: [6, 5]
+          radius: 12 * corners
+          background: linear(0, 0, 1, 1, [alpha(gpuCardTint, 0.14), alpha(surface, 0.44)])
+          border: 1
+          borderColor: alpha(gpuCardTint, 0.14)
+          Column {
+            gap: 2
+            if gpuPct == null {
+              Row {
+                Text { text: "RÉSEAU"; style: label; color: muted; letterSpacing: 1; weight: 1 }
+                Text { text: net.rx == null ? "n/d" : "↓ ${netText}"; style: label; color: cB; maxLines: 1 }
+              }
+              Text { text: net.rx == null ? "non exposé" : "↑ ${netUpText}"; style: label; color: muted; maxLines: 1 }
+              Text { text: net.rx == null ? "Android · accès" : netCumul ? "Android · cumul" : "Android · réseau"; style: label; color: muted; maxLines: 1 }
+            } else {
+              Row {
+                Text { text: "GPU"; style: label; color: muted; weight: 1 }
+                Badge { v: gpuQ }
+              }
+              Text { text: gpuName; fontSize: 13; fontWeight: 700; color: cF; maxLines: 1 }
+              Text { text: "${round(gpuPct)} %"; style: label; color: muted; maxLines: 1 }
+            }
+          }
+        }
+      }
+    }
+    Row {
+      gap: 6
+      padding: [7, 5]
+      radius: 12 * corners
+      background: linear(0, 0, 1, 0, [alpha(cD, 0.10), alpha(surface, 0.44)])
+      border: 1
+      borderColor: alpha(cD, 0.10)
+      Box { width: 3; height: 12; radius: 1.5; background: cD }
+      Text { text: "CONSO"; style: label; color: muted; width: 34; letterSpacing: 1 }
+      AvgChip { label: "5m"; value: avgB.m5; unit: " W"; tint: avgBColor; scale: avgBScale; weight: 1 }
+      AvgChip { label: "1h"; value: avgB.h1; unit: " W"; tint: avgBColor; scale: avgBScale; weight: 1 }
+      AvgChip { label: "6h"; value: avgB.h6; unit: " W"; tint: avgBColor; scale: avgBScale; weight: 1 }
+      AvgChip { label: "1j"; value: avgB.d1; unit: " W"; tint: avgBColor; scale: avgBScale; weight: 1 }
+    }
+    Box {
+      height: tallChart
+      padding: 7
+      radius: 14 * corners
+      background: linear(0, 0, 1, 1, [alpha(cB, 0.14), alpha(surface, 0.46)])
+      border: 1
+      borderColor: alpha(cB, 0.12)
+      Column {
+        gap: 3
+        Row {
+          align: center
+          Text { text: "ACTIVITÉ"; style: label; color: muted; letterSpacing: 1; weight: 1 }
+          Text { text: "5 MIN"; style: label; color: muted; maxLines: 1 }
+          Text { text: "${cpuDisplay == null ? "…" : round(cpuDisplay)} %"; fontSize: 12; fontWeight: 700; color: cB; padding: [5, 1]; radius: 5 * corners; background: alpha(cB, 0.10); maxLines: 1 }
+        }
+        Sparkline { values: cpuHist; min: 0; max: 100; color: cB; area: alpha(cB, 0.16); fill: width; weight: 1; thickness: 2 }
+      }
+    }
+  }
+  screen {
+    title: "Performance"
+    Column {
+      gap: 12
+      padding: 8
+      scroll: true
+      onPull: refresh()
+      Box {
+        padding: 14
+        radius: 20 * corners
+        background: linear(0, 0, 1, 1, [alpha(batColor, 0.26), alpha(surface, 0.42), alpha(cB, 0.10)])
+        border: 1
+        borderColor: alpha(batColor, 0.22)
+        Column {
+          gap: 10
+          Row {
+            align: center
+            gap: 6
+            fill: width
+            Text { text: "BATTERIE"; style: label; color: muted; letterSpacing: 1.2 }
+            Box { width: 26; height: 2; radius: 1; background: linear(0, 0, 1, 0, [alpha(batColor, 0.0), alpha(batColor, 0.70)]) }
+            Badge { v: batQ; big: true }
+            Spacer { weight: 1 }
+            Text { text: "ÉTAT"; style: label; color: muted; maxLines: 1 }
+            Badge { v: overall; big: true }
+          }
+          Row {
+            gap: 12
+            fill: width
+            Dial { label: "${bat.level ?? "…"}"; value: bat.level ?? 0; cap: 100; tint: batColor; size: 108; thickness: 8; ticks: true }
+            Column {
+              gap: 2
+              weight: 1
+              Text { text: charging ? "En charge" : "Décharge"; style: small; color: powerColor; maxLines: 1 }
+              Row {
+                align: bottom
+                Text { text: drawW == null ? "…" : "${fixed(drawW, 1)}"; fontSize: 30; fontWeight: 700; color: powerColor; maxLines: 1 }
+                Text { text: " W"; style: small; color: muted; maxLines: 1 }
+              }
+              Sparkline { values: wattsHist; min: 0; max: chartWMax; color: powerColor; area: alpha(powerColor, 0.14); fill: width; height: 18; thickness: 1.6 }
+              Text { text: "${temp == null ? "…" : round(temp)} °C · ${bat.voltage == null ? "…" : fixed(bat.voltage, 2)} V"; style: label; color: muted; maxLines: 1 }
+              if batHealthLine != null { Text { text: batHealthLine; style: label; color: muted; maxLines: 1 } }
+            }
+          }
+        }
+      }
+      Row {
+        align: center
+        gap: 6
+        fill: width
+        Box { width: 6; height: 6; radius: 3; background: cA }
+        Text { text: "LIVE · auto 5 s"; style: label; color: muted; weight: 1; maxLines: 1 }
+        if modes.saver == true { Text { text: "ÉCO"; fontSize: 10; fontWeight: 700; color: cC; padding: [6, 2]; radius: 5 * corners; background: alpha(cC, 0.12); maxLines: 1 } }
+        if modes.dnd == true { Text { text: "DND"; fontSize: 10; fontWeight: 700; color: cF; padding: [6, 2]; radius: 5 * corners; background: alpha(cF, 0.12); maxLines: 1 } }
+        if adb { Text { text: "ADB"; fontSize: 10; fontWeight: 700; color: cE; padding: [6, 2]; radius: 5 * corners; background: alpha(cE, 0.12); maxLines: 1 } }
+        Text { text: "↻ Actualiser"; fontSize: 11; fontWeight: 700; color: cB; padding: [8, 4]; radius: 8 * corners; background: alpha(cB, 0.10); border: 1; borderColor: alpha(cB, 0.20); maxLines: 1; onTap: { haptic(); refresh() } }
+      }
+      Flow {
+        gap: 8
+        StatPill { label: "SoC"; value: socName; tint: cF }
+        StatPill { label: "CŒURS"; value: "${cores} · ${cpuMaxGhz == null ? "…" : fixed(cpuMaxGhz, 2)} GHz"; tint: cA }
+        StatPill { label: "ÉCRAN"; value: "${screenHz} Hz"; tint: cB }
+        StatPill { label: "RÉSOLUTION"; value: screenRes; tint: cF }
+        StatPill { label: "STOCKAGE"; value: "${storagePct == null ? "…" : round(storagePct)} %"; tint: cC }
+      }
+      Box {
+        padding: 11
+        radius: 14 * corners
+        background: linear(0, 0, 1, 1, [alpha(surface, 0.52), alpha(surface, 0.34)])
+        border: 1
+        borderColor: alpha(border, 0.18)
+        Column {
+          gap: 6
+          SectionTitle { title: "MOYENNES"; hint: "5 min · 1 h · 6 h · 1 j"; tint: cC }
+          Row {
+            Text { text: ""; width: 84 }
+            Text { text: "5 min"; style: label; color: muted; weight: 1; align: end }
+            Text { text: "1 h"; style: label; color: muted; weight: 1; align: end }
+            Text { text: "6 h"; style: label; color: muted; weight: 1; align: end }
+            Text { text: "1 j"; style: label; color: muted; weight: 1; align: end }
+          }
+          AvgRow { name: "Batterie"; tint: avgBColor; a: avgB.m5; b: avgB.h1; c: avgB.h6; d: avgB.d1; unit: " W"; digits: 1 }
+          AvgRow { name: "CPU Linux"; tint: cB; a: avgC.m5; b: avgC.h1; c: avgC.h6; d: avgC.d1; unit: " %"; digits: 0 }
+          AvgRow { name: "RAM Android"; tint: cC; a: avgR.m5; b: avgR.h1; c: avgR.h6; d: avgR.d1; unit: " %"; digits: 0 }
+        }
+      }
+      SectionTitle { title: "PLUS GROS CONSOMMATEURS"; hint: "Linux en direct"; tint: cD }
+      Row {
+        gap: 8
+        Box {
+          weight: 1
+          padding: 9
+          radius: 14 * corners
+          background: linear(0, 0, 1, 1, [alpha(cB, 0.16), alpha(surface, 0.42)])
+          border: 1
+          borderColor: alpha(cB, 0.14)
+          Column {
+            gap: 5
+            Row {
+              align: center
+              gap: 5
+              Box { width: 3; height: 12; radius: 1.5; background: cB }
+              Text { text: "CPU LINUX"; style: label; color: cB; weight: 1; letterSpacing: 1 }
+              Text { text: "top 5"; style: label; color: muted }
+            }
+            for p, i in cpuTop5 key p.pid {
+              Column {
+                gap: 2
+                Row {
+                  align: center
+                  gap: 4
+                  Text { text: "${i + 1}"; style: label; color: i == 0 ? cD : muted; width: 12; maxLines: 1 }
+                  Text { text: p.name; style: label; weight: 1; maxLines: 1 }
+                  Text { text: "${round(p.cpu, 1)}%"; style: label; color: p.cpu >= 50 ? cE : p.cpu >= 20 ? cD : p.cpu >= 5 ? cC : cA; width: 38; align: end; maxLines: 1 }
+                  Box {
+                    width: 32
+                    height: 32
+                    align: center
+                    radius: 8 * corners
+                    onTap: {
+                      if killPid == p.pid {
+                        killPid = 0
+                        killAt = 0
+                        haptic()
+                        run("kill ${int(p.pid)} 2>/dev/null")
+                      } else {
+                        killPid = p.pid
+                        killAt = (now ?? 0) + 5
+                        haptic()
+                      }
+                    }
+                    Box {
+                      width: 22
+                      height: 22
+                      align: center
+                      radius: 6 * corners
+                      background: alpha(cE, killPid == p.pid ? 0.26 : 0.04)
+                      border: 1
+                      borderColor: alpha(cE, killPid == p.pid ? 0.50 : 0.14)
+                      Image {
+                        src: killPid == p.pid ? killCheck : killCross
+                        size: 14
+                        tint: alpha(cE, killPid == p.pid ? 1 : 0.72)
+                        label: killPid == p.pid ? "confirmer l'arrêt du processus" : "arrêter le processus"
+                      }
+                    }
+                  }
+                }
+                Progress { value: p.cpu; max: maxProcCpu; height: 5; fill: width; color: cB; track: alpha(cB, 0.14) }
+              }
+            }
+            if len(cpuTop5) == 0 { Text { text: "Aucun processus visible"; style: label; color: muted } }
+          }
+        }
+        Box {
+          weight: 1
+          padding: 9
+          radius: 14 * corners
+          background: linear(0, 0, 1, 1, [alpha(cC, 0.16), alpha(surface, 0.42)])
+          border: 1
+          borderColor: alpha(cC, 0.14)
+          Column {
+            gap: 5
+            Row {
+              align: center
+              gap: 5
+              Box { width: 3; height: 12; radius: 1.5; background: cC }
+              Text { text: "RAM LINUX"; style: label; color: cC; weight: 1; letterSpacing: 1 }
+              Text { text: "top 5"; style: label; color: muted }
+            }
+            for p, i in ramTop5 key p.pid {
+              Column {
+                gap: 2
+                Row {
+                  align: center
+                  gap: 4
+                  Text { text: "${i + 1}"; style: label; color: i == 0 ? cD : muted; width: 12; maxLines: 1 }
+                  Text { text: p.name; style: label; weight: 1; maxLines: 1 }
+                  Text { text: fmtBytes(p.rss); style: label; color: p.rss >= 500000000 ? cE : p.rss >= 250000000 ? cD : p.rss >= 100000000 ? cC : cA; width: 42; align: end; maxLines: 1 }
+                  Box {
+                    width: 32
+                    height: 32
+                    align: center
+                    radius: 8 * corners
+                    onTap: {
+                      if killPid == p.pid {
+                        killPid = 0
+                        killAt = 0
+                        haptic()
+                        run("kill ${int(p.pid)} 2>/dev/null")
+                      } else {
+                        killPid = p.pid
+                        killAt = (now ?? 0) + 5
+                        haptic()
+                      }
+                    }
+                    Box {
+                      width: 22
+                      height: 22
+                      align: center
+                      radius: 6 * corners
+                      background: alpha(cE, killPid == p.pid ? 0.26 : 0.04)
+                      border: 1
+                      borderColor: alpha(cE, killPid == p.pid ? 0.50 : 0.14)
+                      Image {
+                        src: killPid == p.pid ? killCheck : killCross
+                        size: 14
+                        tint: alpha(cE, killPid == p.pid ? 1 : 0.72)
+                        label: killPid == p.pid ? "confirmer l'arrêt du processus" : "arrêter le processus"
+                      }
+                    }
+                  }
+                }
+                Progress { value: p.rss; max: maxProcRss; height: 5; fill: width; color: cC; track: alpha(cC, 0.14) }
+              }
+            }
+            if len(ramTop5) == 0 { Text { text: "Aucun processus visible"; style: label; color: muted } }
+          }
+        }
+      }
+      if killPid != 0 {
+        Row {
+          align: center
+          gap: 6
+          fill: width
+          padding: [8, 5]
+          radius: 9 * corners
+          background: alpha(cE, 0.10)
+          border: 1
+          borderColor: alpha(cE, 0.24)
+          Text { text: "Arrêt armé"; style: label; color: cE; fontWeight: 700; maxLines: 1 }
+          Text { text: "${killName == "" ? "Processus sélectionné" : killName} · toucher ✓ pour confirmer"; style: label; color: muted; weight: 1; maxLines: 1 }
+        }
+      }
+      Text { text: "Processus Linux. Android ne partage pas le détail de ses apps."; style: label; color: muted }
+      Box {
+        padding: [12, 8]
+        radius: 11 * corners
+        background: linear(0, 0, 1, 0, [alpha(purgeTone, confirmPurge ? 0.34 : purgeDone ? 0.22 : 0.14), alpha(purgeTone, confirmPurge ? 0.18 : purgeDone ? 0.10 : 0.06)])
+        border: 1
+        borderColor: alpha(purgeTone, confirmPurge ? 0.55 : purgeDone ? 0.40 : 0.25)
+        align: center
+        Column {
+          gap: 1
+          align: center
+          Text { text: confirmPurge ? "Confirmer la purge ?" : purgeDone ? "Purge envoyée ✓" : "Purger les gros processus"; color: purgeTone; fontWeight: 700; maxLines: 1 }
+          if confirmPurge { Text { text: "Toucher à nouveau · annulation auto"; style: label; color: muted; maxLines: 1 } }
+        }
+        onTap: {
+          if confirmPurge {
+            confirmPurge = false
+            confirmAt = 0
+            purgeAt = (now ?? 0) + 5
+            haptic()
+            run(purgeCmd)
+          } else {
+            confirmPurge = true
+            confirmAt = (now ?? 0) + 6
+            haptic()
+          }
+        }
+      }
+      SectionTitle { title: "ANDROID · APPS"; hint: appMode == "recent" ? "dernières ouvertes" : "les plus utilisées"; tint: cA }
+      Row {
+        align: center
+        gap: 6
+        fill: width
+        Text { text: "RÉCENTES"; fontSize: 10; fontWeight: 700; color: appMode == "recent" ? cA : muted; padding: [8, 3]; radius: 7 * corners; background: alpha(cA, appMode == "recent" ? 0.12 : 0.04); border: 1; borderColor: alpha(cA, appMode == "recent" ? 0.30 : 0.12); maxLines: 1; onTap: appMode = "recent" }
+        Text { text: "FRÉQUENTES"; fontSize: 10; fontWeight: 700; color: appMode == "frequent" ? cA : muted; padding: [8, 3]; radius: 7 * corners; background: alpha(cA, appMode == "frequent" ? 0.12 : 0.04); border: 1; borderColor: alpha(cA, appMode == "frequent" ? 0.30 : 0.12); maxLines: 1; onTap: appMode = "frequent" }
+        Spacer { weight: 1 }
+        Text { text: appMode == "recent" ? "ordre d'ouverture" : "score du launcher"; style: label; color: muted; maxLines: 1 }
+      }
+      Box {
+        padding: 10
+        radius: 14 * corners
+        background: linear(0, 0, 1, 1, [alpha(cA, 0.12), alpha(surface, 0.44)])
+        border: 1
+        borderColor: alpha(cA, 0.14)
+        Column {
+          gap: 5
+          if len(currentApps) == 0 {
+            Text { text: appMode == "recent" ? "Aucune app récente" : "Aucune app fréquente"; style: label; color: muted }
+          } else {
+            for a, i in currentApps key a.key {
+              Row {
+                align: center
+                gap: 8
+                padding: [3, 0]
+                Text { text: "${i + 1}"; style: label; color: muted; width: 12; maxLines: 1 }
+                Image { src: a.icon; size: 22; label: a.name }
+                Text { text: a.name; style: label; weight: 1; maxLines: 1 }
+                Text { text: a.last == null ? "jamais" : fmtAgo(a.last, nowSec); style: label; color: muted; maxLines: 1 }
+                onTap: open(a.key)
+              }
+            }
+          }
+        }
+      }
+      Text { text: appNote; style: label; color: muted }
+      if batteryDetail {
+        SectionTitle { title: "ANDROID · BATTERIE"; hint: "charge & santé"; tint: cC }
+        Box {
+          padding: 10
+          radius: 14 * corners
+          background: linear(0, 0, 1, 1, [alpha(cC, 0.12), alpha(surface, 0.44)])
+          border: 1
+          borderColor: alpha(cC, 0.14)
+          Grid {
+            columns: 2
+            gap: 8
+            Detail { label: "CHARGE"; value: charging ? "en cours" : "sur batterie"; tint: powerColor }
+            Detail { label: "CHARGEUR"; value: charging ? (chargerW == null ? (bat.plugged == null ? "branché" : "${bat.plugged}") : "${fixed(chargerW, 1)} W max") : "débranché"; tint: cB }
+            Detail { label: "TEMPS PLEIN"; value: chargeLeft; tint: cB }
+            Detail { label: "COURANT"; value: currentMa; tint: cD }
+            Detail { label: "RESTANT"; value: chargeMah; tint: cC }
+            Detail { label: "SANTÉ"; value: healthFr; tint: cA }
+            Detail { label: "CYCLES"; value: bat.cycles == null ? null : "${bat.cycles}"; tint: cC }
+            Detail { label: "TECHNOLOGIE"; value: bat.technology; tint: cF }
+          }
+        }
+      }
+      Row {
+        align: center
+        gap: 6
+        fill: width
+        Text { text: showAndroidAll ? "RÉDUIRE" : "TOUT ANDROID"; fontSize: 10; fontWeight: 700; color: cB; padding: [8, 3]; radius: 7 * corners; background: alpha(cB, 0.10); border: 1; borderColor: alpha(cB, 0.25); maxLines: 1; onTap: { showAndroidAll = !showAndroidAll; haptic() } }
+        Spacer { weight: 1 }
+        Text { text: "état & contrôle"; style: label; color: muted; maxLines: 1 }
+      }
+      if showAndroidAll {
+        SectionTitle { title: "ANDROID · ÉTAT"; hint: "appareil · modes · réseau"; tint: cB }
+        Box {
+          padding: 10
+          radius: 14 * corners
+          background: linear(0, 0, 1, 1, [alpha(cB, 0.10), alpha(surface, 0.44)])
+          border: 1
+          borderColor: alpha(cB, 0.14)
+          Grid {
+            columns: 2
+            gap: 8
+            Detail { label: "APPAREIL"; value: deviceLabel; tint: cB }
+            Detail { label: "ANDROID"; value: androidLabel; tint: cB }
+            Detail { label: "SOC"; value: sys.cpu.soc; tint: cF }
+            Detail { label: "ABI"; value: sys.cpu.abi; tint: cF }
+            Detail { label: "NOYAU"; value: sys.kernel; tint: cB }
+            Detail { label: "UPTIME"; value: uptimeText; tint: cB }
+            Detail { label: "APPS"; value: sys.apps == null ? null : "${sys.apps}"; tint: cA }
+            Detail { label: "THÈME"; value: sys.theme; tint: cF }
+            Detail { label: "MODE"; value: modes.saver == null ? null : modes.saver ? "économie" : "normal"; tint: modes.saver == true ? cC : cA }
+            Detail { label: "DND"; value: dndText; tint: cF }
+            Detail { label: "SONNERIE"; value: ringerText; tint: cF }
+            Detail { label: "LUMIÈRE"; value: brightnessText; tint: cC }
+            Detail { label: "ROTATION"; value: modes.rotate == null ? null : modes.rotate ? "auto" : "fixe"; tint: cB }
+            Detail { label: "SOMBRE"; value: modes.dark == null ? null : modes.dark ? "on" : "off"; tint: cF }
+            Detail { label: "AVION"; value: modes.airplane == null ? null : modes.airplane ? "on" : "off"; tint: cB }
+            Detail { label: "WI-FI"; value: modes.wifi == null ? null : modes.wifi ? "on" : "off"; tint: cB }
+            Detail { label: "BT"; value: modes.bluetooth == null ? null : modes.bluetooth ? "on" : "off"; tint: cB }
+            Detail { label: "POSITION"; value: modes.location == null ? null : modes.location ? "on" : "off"; tint: cB }
+            Detail { label: "OPÉRATEUR"; value: simText; tint: cA }
+            Detail { label: "DATA"; value: sim.data == null ? null : sim.data ? "on" : "off"; tint: cA }
+            Detail { label: "ITINÉRANCE"; value: sim.roaming == null ? null : sim.roaming ? "oui" : "non"; tint: cA }
+            Detail { label: "STOCKAGE"; value: storageFree; tint: cC }
+            Detail { label: "ÉCRAN"; value: "${screenHz} Hz · ${sys.display.dpi ?? "…"} dpi"; tint: cB }
+            Detail { label: "NOTIFS"; value: notifText; tint: notifs.available == true ? cA : muted }
+          }
+        }
+        SectionTitle { title: "ANDROID · CONTRÔLE"; hint: "actions du launcher"; tint: cD }
+        Flow {
+          gap: 6
+          Text { text: "DND"; fontSize: 10; fontWeight: 700; color: cF; padding: [8, 4]; radius: 7 * corners; background: alpha(cF, 0.10); border: 1; borderColor: alpha(cF, 0.24); maxLines: 1; onTap: { haptic(); dnd("toggle") } }
+          Text { text: "BATTERIE"; fontSize: 10; fontWeight: 700; color: cC; padding: [8, 4]; radius: 7 * corners; background: alpha(cC, 0.10); border: 1; borderColor: alpha(cC, 0.24); maxLines: 1; onTap: { haptic(); settings("battery") } }
+          Text { text: "RÉSEAU"; fontSize: 10; fontWeight: 700; color: cB; padding: [8, 4]; radius: 7 * corners; background: alpha(cB, 0.10); border: 1; borderColor: alpha(cB, 0.24); maxLines: 1; onTap: { haptic(); settings("wifi") } }
+          Text { text: notifs.available == true ? "VIDER NOTIFS" : "ACCÈS NOTIFS"; fontSize: 10; fontWeight: 700; color: cE; padding: [8, 4]; radius: 7 * corners; background: alpha(cE, 0.10); border: 1; borderColor: alpha(cE, 0.24); maxLines: 1; onTap: { haptic(); if notifs.available == true { notification("clear") } else { media("open") } } }
+          Text { text: "ÉCRAN"; fontSize: 10; fontWeight: 700; color: cB; padding: [8, 4]; radius: 7 * corners; background: alpha(cB, 0.10); border: 1; borderColor: alpha(cB, 0.24); maxLines: 1; onTap: { haptic(); settings("display") } }
+          Text { text: "SON"; fontSize: 10; fontWeight: 700; color: cF; padding: [8, 4]; radius: 7 * corners; background: alpha(cF, 0.10); border: 1; borderColor: alpha(cF, 0.24); maxLines: 1; onTap: { haptic(); settings("sound") } }
+        }
+        Text { text: "Le launcher lit toutes les sources Android disponibles et ouvre ces réglages. Le mode ADB débloque le CPU Android et les températures ; sans lui, ces mesures restent hors de portée."; style: label; color: muted }
+        SectionTitle { title: "ANDROID · ADB"; hint: adb ? "hors launcher · live" : "débogage sans fil"; tint: cE }
+        if adb {
+          Box {
+            padding: 10
+            radius: 14 * corners
+            background: linear(0, 0, 1, 1, [alpha(cE, 0.14), alpha(surface, 0.44)])
+            border: 1
+            borderColor: alpha(cE, 0.18)
+            Column {
+              gap: 6
+              Row {
+                align: bottom
+                Text { text: "CPU ANDROID"; style: label; color: muted; weight: 1 }
+                Text { text: adbCpu == null ? "…" : "${fixed(adbCpu, 1)} %"; fontSize: 22; fontWeight: 800; color: cE; maxLines: 1 }
+              }
+              Progress { value: adbCpu ?? 0; max: 100; height: 5; fill: width; color: cE; track: alpha(cE, 0.14) }
+              Grid {
+                columns: 2
+                gap: 8
+                Detail { label: "TEMP MAX"; value: adbThermal == null || adbThermal.max == null ? null : "${fixed(adbThermal.max, 1)} °C"; tint: cD }
+                Detail { label: "CPU °C"; value: adbThermal == null || adbThermal.cpu == null ? null : "${fixed(adbThermal.cpu, 1)} °C"; tint: cD }
+                Detail { label: "GPU °C"; value: adbThermal == null || adbThermal.gpu == null ? null : "${fixed(adbThermal.gpu, 1)} °C"; tint: cF }
+                Detail { label: "MÉMOIRE"; value: adbMem == null ? null : "${fmtBytes(adbMem.used)} / ${fmtBytes(adbMem.total)}"; tint: cC }
+                Detail { label: "MODÈLE"; value: adbModel == "" ? null : adbModel; tint: cB }
+                Detail { label: "SOURCE"; value: "ADB · lecture seule"; tint: cE }
+              }
+            }
+          }
+          Box {
+            padding: 10
+            radius: 14 * corners
+            background: alpha(surface, 0.42)
+            border: 1
+            borderColor: alpha(cE, 0.14)
+            Column {
+              gap: 5
+              Row {
+                Text { text: "PROCESSUS ANDROID"; style: label; color: muted; weight: 1 }
+                Text { text: "top 5"; style: label; color: muted }
+              }
+              if len(adbTop5) == 0 {
+                Text { text: "Aucun processus"; style: label; color: muted }
+              } else {
+                for p, i in adbTop5 key p.pid {
+                  Column {
+                    gap: 2
+                    Row {
+                      align: center
+                      gap: 4
+                      Text { text: "${i + 1}"; style: label; color: muted; width: 12; maxLines: 1 }
+                      Text { text: p.name; style: label; weight: 1; maxLines: 1 }
+                      Text { text: "${fixed(p.cpu, 1)} %"; style: label; color: p.cpu >= 50 ? cE : p.cpu >= 20 ? cD : p.cpu >= 5 ? cC : cA; width: 42; align: end; maxLines: 1 }
+                      Text { text: "${fmtBytes(p.rss)}"; style: label; color: muted; width: 48; align: end; maxLines: 1 }
+                    }
+                    Progress { value: p.cpu; max: adbMaxProcCpu; height: 4; fill: width; color: cE; track: alpha(cE, 0.12) }
+                  }
+                }
+              }
+            }
+          }
+          Text { text: "ADB shell · ${adbAndroid == "" ? "Android" : "Android " + adbAndroid} · ${adbAge == null ? "…" : round(adbAge)} s"; style: label; color: muted }
+          Text { text: "ARRÊTER ADB"; fontSize: 10; fontWeight: 700; color: cE; padding: [8, 4]; radius: 7 * corners; background: alpha(cE, 0.10); border: 1; borderColor: alpha(cE, 0.24); maxLines: 1; onTap: { haptic(); run(adbHelperStop) } }
+        } else {
+          Text { text: "Mode ADB inactif · ${adbReason}. Activez le débogage sans fil, appairez une fois, connectez, puis démarrez le pont."; style: label; color: muted }
+          Text { text: "DÉMARRER ADB"; fontSize: 10; fontWeight: 700; color: cE; padding: [8, 4]; radius: 7 * corners; background: alpha(cE, 0.10); border: 1; borderColor: alpha(cE, 0.24); maxLines: 1; onTap: { haptic(); run(adbHelperStart) } }
+          Text { text: "adb pair IP:PORT  ·  adb connect IP:PORT"; style: label; color: muted; maxLines: 1 }
+        }
+
+      }
+      Box { height: 1; fill: width; background: linear(0, 0, 1, 0, [alpha(border, 0.0), alpha(border, 0.35), alpha(border, 0.0)]) }
+      SectionTitle { title: "TENDANCES"; hint: "5 dernières minutes"; tint: cB }
+      Grid {
+        columns: 2
+        gap: 8
+        ChartCard { title: "CPU LINUX"; value: cpuDisplay; unit: " %"; values: cpuHist; tint: cB; chartMax: 100; sub: "temps réel · 5 min" }
+        ChartCard { title: "RAM ANDROID"; value: ramDisplay; unit: " %"; values: ramHist; tint: cC; chartMax: 100; sub: "utilisée · 5 min" }
+        ChartCard { title: "FRÉQ. CŒURS"; value: freqPct; unit: " %"; values: freqHist; tint: cF; chartMax: 100; sub: "moyenne des cœurs" }
+        ChartCard { title: "CONSO"; value: watts; unit: " W"; values: wattsHist; tint: cD; chartMax: chartWMax; sub: "batterie · 5 min"; digits: 1 }
+      }
+      Row {
+        gap: 8
+        Box {
+          weight: 2
+          padding: 10
+          radius: 14 * corners
+          background: linear(0, 0, 1, 1, [alpha(cF, 0.12), alpha(surface, 0.46)])
+          border: 1
+          borderColor: alpha(cF, 0.14)
+          Column {
+            gap: 5
+            SectionTitle { title: "CŒURS"; hint: "${cores} cœurs · fréq. ${freqPct == null ? "…" : round(freqPct)} %"; tint: cF }
+            if len(coreRatios) == 0 {
+              Text { text: "Fréquences indisponibles"; style: label; color: muted }
+            } else {
+              CoreBars { cores: coreRatios; showLabels: true }
+            }
+            if len(clusters) > 0 { ClusterBars { clusters: clusters } }
+          }
+        }
+        Box {
+          weight: 1
+          padding: 10
+          radius: 14 * corners
+          background: linear(0, 0, 1, 1, [alpha(gpuCardTint, 0.16), alpha(surface, 0.46)])
+          border: 1
+          borderColor: alpha(gpuCardTint, 0.16)
+          Column {
+            gap: 4
+            if gpuPct == null {
+              Row {
+                Text { text: "RÉSEAU"; style: label; color: muted; weight: 1 }
+                Text { text: net.rx == null ? "n/d" : "↓"; style: label; color: cB; maxLines: 1 }
+              }
+              Text { text: net.rx == null ? "non exposé" : netText; fontSize: 18; fontWeight: 700; color: cB; maxLines: 1 }
+              Text { text: net.rx == null ? "Android ne le partage pas" : "↑ ${netUpText}"; style: small; color: muted; maxLines: 1 }
+              if net.mobileRx != null && mobileDownRate != null && wifiDownRate != null {
+                Text { text: "Wi-Fi ↓ ${wifiText}"; style: label; color: muted; maxLines: 1 }
+                Text { text: "Mobile ↓ ${mobileText}"; style: label; color: muted; maxLines: 1 }
+              }
+              if net.rx != null { Sparkline { values: netHist; min: 0; max: netMax; color: cB; area: alpha(cB, 0.10); fill: width; height: 24; thickness: 1.5 } }
+              Text { text: net.rx == null ? "Android · accès" : netCumul ? "Android · cumul" : "Android · réseau"; style: label; color: muted; maxLines: 1 }
+            } else {
+              Row {
+                Text { text: "GPU"; style: label; color: muted; weight: 1 }
+                Badge { v: gpuQ }
+              }
+              Text { text: gpuName; fontSize: 18; fontWeight: 700; color: cF; maxLines: 1 }
+              Text { text: "${round(gpuPct)} %"; style: small; color: gpuColor; maxLines: 1 }
+              Text { text: "${screenHz} Hz · ${screenRes}"; style: label; color: muted; maxLines: 1 }
+            }
+          }
+        }
+      }
+      SectionTitle { title: "AUJOURD'HUI"; hint: "log Linux · moy. 30 min"; tint: cA }
+      Grid {
+        columns: 3
+        gap: 8
+        ChartCard { title: "CPU"; value: trendCpuLast; unit: " %"; values: trendCpu; tint: cB; chartMax: 50; sub: "journée" }
+        ChartCard { title: "RAM"; value: trendRamLast; unit: " %"; values: trendRam; tint: cC; chartMax: 100; sub: "journée" }
+        ChartCard { title: "FRÉQ."; value: trendFreqLast; unit: " %"; values: trendFreq; tint: cF; chartMax: 100; sub: "journée" }
+      }
+      Column {
+        gap: 3
+        padding: [9, 7]
+        radius: 10 * corners
+        background: alpha(surface, 0.30)
+        border: 1
+        borderColor: alpha(border, 0.18)
+        Text { text: "Notes A+ → E : usage CPU/RAM, consommation et température. A+ = sain, E = critique."; style: label; color: muted }
+        Text { text: "RAM, stockage, réseau, batterie, apps récentes : Android. CPU Linux, processus : Linux. Fréquence et GPU : sysfs. Android ne partage ni le CPU global ni le CPU par app sans ADB."; style: label; color: muted }
+        Text { text: "Journal brut : ~/.local/share/omalauncher/perf/raw-YYYY-MM-DD.jsonl · 1/min · 30 j"; style: label; color: muted }
+        Text { text: "Moyennes lissées, mises à jour quand la page est visible."; style: label; color: muted }
+      }
+    }
+  }
+}
